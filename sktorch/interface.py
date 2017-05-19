@@ -1,6 +1,6 @@
 #coding:utf-8
 
-from typing import Any, Iterable, Callable, Union, Sequence as Seq, Optional as Opt
+from typing import Any, Tuple, Iterable, Callable, Union, Sequence as Seq, Optional as Opt
 from collections import deque
 from numpy import ndarray
 import torch
@@ -8,7 +8,7 @@ from torch import autograd
 from torch import nn
 from torch import optim
 from torch.nn.modules import loss
-from .util import cuda_available, peek, efficient_batch_iterator, T1, T2, Tensor
+from .util import cuda_available, peek, efficient_batch_iterator, TupleIteratorDataLoader, T1, T2, Tensor
 
 DEFAULT_BATCH_SIZE = 32
 
@@ -32,8 +32,9 @@ class TorchModel:
                  optimizer: optim.Optimizer,
                  optimizer_kwargs: Opt[dict]=None,
                  input_encoder: Opt[Callable[[T1], Tensor]]=None,
-                 output_encoder: Opt[Callable[[T2], Tensor]]=None,
-                 output_decoder: Opt[Callable[[Tensor], T2]] = None,
+                 target_encoder: Opt[Callable[[T2], Tensor]]=None,
+                 output_decoder: Opt[Callable[[Tensor], T2]]=None,
+                 is_classifier: bool=False,
                  estimate_normalization_samples: Opt[int]=None,
                  print_func: Callable[[Any], None]=print, num_dataloader_workers: int=-2):
         """
@@ -49,6 +50,7 @@ class TorchModel:
         self.gpu_enabled = cuda_available()
         self._torch_module = None
         self._optimizer = None
+        self.is_classifier = is_classifier
 
         # property setter method ensures this goes to the gpu if it's available
         self.torch_module = torch_module
@@ -69,7 +71,7 @@ class TorchModel:
         self._norm_estimated = False
 
         self.encode_input = input_encoder
-        self.encode_target = output_encoder
+        self.encode_target = target_encoder
         if output_decoder is not None:
             self.decode_output = output_decoder
 
@@ -187,10 +189,14 @@ class TorchModel:
             batch_size: int=DEFAULT_BATCH_SIZE, shuffle: bool=False, epochs: int=1,
             min_epochs: int=1, min_rel_improvement: float=1e-5, epochs_without_improvement: int=5,
             batch_report_interval: Opt[int]=None, epoch_report_interval: Opt[int]=None):
+        """This method fits the *entire* pipeline, including input normalization. Initialization of weight/bias
+        parameters in the torch_module is up to you; there is no obvious canonical way to do it here."""
+
         if self.should_normalize:
             sample, X = peek(X, self.norm_n_samples)
             if self.encode_input:
-                sample = torch.stack([self.encode_input(x) for x in sample])
+                sample = [self.encode_input(x) for x in sample]
+            sample = torch.stack(sample)
             self.estimate_normalization(sample)
 
         self.update(X=X, y=y, X_test=X_test, y_test=y_test,
@@ -206,22 +212,78 @@ class TorchModel:
                batch_size: int=DEFAULT_BATCH_SIZE, shuffle: bool=False, epochs: int=1,
                min_epochs: int=1, min_rel_improvement: Opt[float]=1e-5, epochs_without_improvement: int=5,
                batch_report_interval: Opt[int]=None, epoch_report_interval: Opt[int]=None):
+        """Update model parameters in light of new data X and y.
+        This method handles packaging X and y into a batch iterator of the kind that torch modules expect"""
         assert epochs > 0
 
-        dataset = efficient_batch_iterator(X, y, X_encoder=self.encode_input, y_encoder=self.encode_target,
-                                           batch_size=batch_size, shuffle=shuffle,
-                                           num_workers=self.num_dataloader_workers)
+        data_kw = dict(X_encoder=self.encode_input, y_encoder=self.encode_target,
+                       batch_size=batch_size, shuffle=shuffle,
+                       num_workers=self.num_dataloader_workers, classifier=self.is_classifier)
+
+        dataset = efficient_batch_iterator(X, y, **data_kw)
         if X_test is not None and y_test is not None:
-            test_data = efficient_batch_iterator(X_test, y_test, X_encoder=self.encode_input,
-                                                 y_encoder=self.encode_target,
-                                                 batch_size=batch_size, shuffle=shuffle,
-                                                 num_workers=self.num_dataloader_workers)
+            test_data = efficient_batch_iterator(X_test, y_test, **data_kw)
         else:
             if X_test is not None or y_test is not None:
                 self.print("Warning: test data was provided but either the regressors or the response were omitted")
             test_data = None
 
-        if test_data is None:
+        self._update(dataset, test_data, epochs=epochs, min_epochs=min_epochs, min_rel_improvement=min_rel_improvement,
+                     epochs_without_improvement=epochs_without_improvement, batch_report_interval=batch_report_interval,
+                     epoch_report_interval=epoch_report_interval)
+
+    @training_mode(True)
+    def fit_zipped(self, dataset: Iterable[Tuple[T1, T2]], test_dataset: Opt[Iterable[Tuple[T1, T2]]]=None,
+                   batch_size: int = DEFAULT_BATCH_SIZE, epochs: int = 1,
+                   min_epochs: int = 1, min_rel_improvement: float = 1e-5, epochs_without_improvement: int = 5,
+                   batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
+        """For fitting to an iterable sequence of pairs, such as may arise in very large streaming datasets from sources
+        that don't fit the random access and known-length requirements of a torch.data.Dataset (e.g. a sequence of
+        sentences split from a set of text files as might arise in NLP applications.
+        Like TorchModel.fit(), this estimates input normalization before the weight update, and weight initialization of
+        the torch_module is up to you."""
+
+        if self.should_normalize:
+            sample, dataset = peek(dataset, self.norm_n_samples)
+            sample = [t[0] for t in sample]
+            if self.encode_input:
+                sample = [self.encode_input(x) for x in sample]
+            sample = torch.stack(sample)
+            self.estimate_normalization(sample)
+
+        self.update_zipped(dataset=dataset, test_dataset=test_dataset, batch_size=batch_size,
+                           epochs=epochs, min_epochs=min_epochs, min_rel_improvement=min_rel_improvement,
+                           epochs_without_improvement=epochs_without_improvement,
+                           batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
+
+    @training_mode(True)
+    def update_zipped(self, dataset: Iterable[Tuple[T1, T2]], test_dataset: Opt[Iterable[Tuple[T1, T2]]]=None,
+                      batch_size: int = DEFAULT_BATCH_SIZE, epochs: int = 1,
+                      min_epochs: int = 1, min_rel_improvement: Opt[float] = 1e-5, epochs_without_improvement: int = 5,
+                      batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
+        """For updating model parameters in light of an iterable sequence of (x,y) pairs, such as may arise in very
+        large streaming datasets from sources that don't fit the random access and known-length requirements of a
+        torch.data.Dataset (e.g. a sequence of sentences split from a set of text files as might arise in NLP
+        applications."""
+
+        data_kw = dict(batch_size=batch_size, classifier=self.is_classifier,
+                       X_encoder=self.encode_input,
+                       y_encoder=self.encode_target)
+
+        dataset = TupleIteratorDataLoader(dataset, **data_kw)
+
+        if test_dataset is not None:
+            test_dataset = TupleIteratorDataLoader(test_dataset, **data_kw)
+
+        self._update(dataset, test_dataset, epochs=epochs, min_epochs=min_epochs,
+                     min_rel_improvement=min_rel_improvement, epochs_without_improvement=epochs_without_improvement,
+                     batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
+
+
+    def _update(self, batches: Iterable[Tuple[Tensor, Tensor]], test_batches: Opt[Iterable[Tuple[Tensor, Tensor]]],
+                epochs: int = 1, min_epochs: int = 1, min_rel_improvement: Opt[float] = 1e-5, epochs_without_improvement: int = 5,
+                batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
+        if test_batches is None:
             losstype = 'training'
         else:
             losstype = 'test'
@@ -237,7 +299,7 @@ class TorchModel:
 
             running_loss = 0.0
             running_samples = 0
-            for i, (X_batch, y_batch) in enumerate(dataset):
+            for i, (X_batch, y_batch) in enumerate(batches):
                 n_samples = X_batch.size()[0]
                 running_samples += n_samples
 
@@ -249,8 +311,8 @@ class TorchModel:
                     self.report_batch(epoch, i, err.data[0])
 
             epoch_loss = running_loss / running_samples
-            if test_data is not None:
-                epoch_loss = self._error(test_data)
+            if test_batches is not None:
+                epoch_loss = self._error(test_batches)
 
             if epoch_report_interval and epoch % epoch_report_interval == epoch_report_interval - 1:
                 self.report_epoch(epoch, epoch_loss, losstype)
@@ -301,7 +363,7 @@ class TorchModel:
 
     @training_mode(False)
     def predict(self, X: Iterable[Any], batch_size: int = DEFAULT_BATCH_SIZE, shuffle: bool=False) -> Iterable[Any]:
-        dataset = efficient_batch_iterator(X, X_encoder=self.encode_input, y_encoder=self.encode_target,
+        dataset = efficient_batch_iterator(X, X_encoder=self.encode_input, y_encoder=self.encode_input,
                                            batch_size=batch_size, shuffle=shuffle, 
                                            num_workers=self.num_dataloader_workers)
         for X_batch, X_batch2 in dataset:
@@ -315,7 +377,7 @@ class TorchModel:
         return X
 
     @staticmethod
-    def encode_output(y: T2) -> Tensor:
+    def encode_target(y: T2) -> Tensor:
         """encode the output to a tensor that can be used to compute the error of a neural net prediction;
         this can be passed to the class constructor for customizability, else it is assumed to be the identity."""
         return y
