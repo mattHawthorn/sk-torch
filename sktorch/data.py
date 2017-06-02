@@ -74,6 +74,9 @@ class Vocabulary:
                 self.ID[token] = self.maxID
                 self.token[self.maxID] = token
 
+    def __len__(self):
+        return len(self.ID)
+
 
 #####################################################################
 # Data set utils                                                    #

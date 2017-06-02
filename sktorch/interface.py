@@ -40,9 +40,10 @@ class TorchModel:
                  output_decoder: Opt[Callable[[TensorType], T2]]=None,
                  is_classifier: bool=False,
                  estimate_normalization_samples: Opt[int]=None,
-                 print_func: Callable[[Any], None]=print,
+                 default_batch_size: int=DEFAULT_BATCH_SIZE,
                  stopping_criterion: Callable[[List[float], float], Union[bool, Tuple[bool, Opt[str]]]]=
                     last_epoch_min_rel_improvement,
+                 print_func: Callable[[Any], None]=print,
                  num_dataloader_workers: int=-2):
         """
         :param torch_module: a torch.nn.Module
@@ -86,6 +87,7 @@ class TorchModel:
         # you could pass in a logger.info/debug or a file.write method for this if you like
         self.print = print_func
         self.stopping_criterion = stopping_criterion
+        self.default_batch_size=default_batch_size
 
         self.norm_n_samples = estimate_normalization_samples
         self._input_mean = None
@@ -235,12 +237,12 @@ class TorchModel:
 
     @training_mode(True)
     def fit(self, X: Iterable[T1], y: Iterable[T2], X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
-            batch_size: int=DEFAULT_BATCH_SIZE, shuffle: bool=False, max_epochs: int=1,
+            batch_size: Opt[int]=None, shuffle: bool=False, max_epochs: int=1,
             min_epochs: int=1, min_rel_improvement: float=1e-5, epochs_without_improvement: int=5,
             batch_report_interval: Opt[int]=None, epoch_report_interval: Opt[int]=None):
         """This method fits the *entire* pipeline, including input normalization. Initialization of weight/bias
         parameters in the torch_module is up to you; there is no obvious canonical way to do it here."""
-
+        batch_size = batch_size or self.default_batch_size
         if self.should_normalize:
             sample, X = peek(X, self.norm_n_samples)
             if self.encode_input:
@@ -258,13 +260,13 @@ class TorchModel:
 
     @training_mode(True)
     def update(self, X: Iterable[T1], y: Iterable[T2], X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
-               batch_size: int=DEFAULT_BATCH_SIZE, shuffle: bool=False, max_epochs: int=1,
+               batch_size: Opt[int] = None, shuffle: bool=False, max_epochs: int=1,
                min_epochs: int=1, min_rel_improvement: Opt[float]=1e-5, epochs_without_improvement: int=5,
                batch_report_interval: Opt[int]=None, epoch_report_interval: Opt[int]=None):
         """Update model parameters in light of new data X and y.
         This method handles packaging X and y into a batch iterator of the kind that torch modules expect"""
         assert max_epochs > 0
-
+        batch_size = batch_size or self.default_batch_size
         data_kw = dict(X_encoder=self.encode_input, y_encoder=self.encode_target,
                        batch_size=batch_size, shuffle=shuffle,
                        num_workers=self.num_dataloader_workers, classifier=self.is_classifier)
@@ -283,7 +285,7 @@ class TorchModel:
 
     @training_mode(True)
     def fit_zipped(self, dataset: Iterable[Tuple[T1, T2]], test_dataset: Opt[Iterable[Tuple[T1, T2]]]=None,
-                   batch_size: int = DEFAULT_BATCH_SIZE, max_epochs: int = 1,
+                   batch_size: Opt[int] = None, max_epochs: int = 1,
                    min_epochs: int = 1, min_rel_improvement: float = 1e-5, epochs_without_improvement: int = 5,
                    batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
         """For fitting to an iterable sequence of pairs, such as may arise in very large streaming datasets from sources
@@ -292,7 +294,7 @@ class TorchModel:
         Like TorchModel.fit(), this estimates input normalization before the weight update, and weight initialization of
         the torch_module is up to you.
         This method handles packaging X and y into a batch iterator of the kind that torch modules expect"""
-
+        batch_size = batch_size or self.default_batch_size
         if self.should_normalize:
             sample, dataset = peek(dataset, self.norm_n_samples)
             sample = [t[0] for t in sample]
@@ -308,14 +310,14 @@ class TorchModel:
 
     @training_mode(True)
     def update_zipped(self, dataset: Iterable[Tuple[T1, T2]], test_dataset: Opt[Iterable[Tuple[T1, T2]]]=None,
-                      batch_size: int = DEFAULT_BATCH_SIZE, max_epochs: int = 1,
+                      batch_size: Opt[int] = None, max_epochs: int = 1,
                       min_epochs: int = 1, min_rel_improvement: Opt[float] = 1e-5, epochs_without_improvement: int = 5,
                       batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
         """For updating model parameters in light of an iterable sequence of (x,y) pairs, such as may arise in very
         large streaming datasets from sources that don't fit the random access and known-length requirements of a
         torch.data.Dataset (e.g. a sequence of sentences split from a set of text files as might arise in NLP
         applications."""
-
+        batch_size = batch_size or self.default_batch_size
         data_kw = dict(batch_size=batch_size, classifier=self.is_classifier,
                        X_encoder=self.encode_input,
                        y_encoder=self.encode_target)
@@ -443,7 +445,8 @@ class TorchModel:
         return stop
 
     @training_mode(False)
-    def error(self, X: Iterable[T1], y: Iterable[T2], batch_size: int = DEFAULT_BATCH_SIZE, shuffle: bool=False) -> float:
+    def error(self, X: Iterable[T1], y: Iterable[T2], batch_size: Opt[int]=None, shuffle: bool=False) -> float:
+        batch_size = batch_size or self.default_batch_size
         dataset = efficient_batch_iterator(X, y, X_encoder=self.encode_input, y_encoder=self.encode_target,
                                            batch_size=batch_size, shuffle=shuffle, 
                                            num_workers=self.num_dataloader_workers)
@@ -451,13 +454,13 @@ class TorchModel:
         return err / n_samples
 
     @training_mode(False)
-    def error_zipped(self, dataset: Iterable[Tuple[T1, T2]], batch_size: int = DEFAULT_BATCH_SIZE) -> float:
+    def error_zipped(self, dataset: Iterable[Tuple[T1, T2]], batch_size: Opt[int]=None) -> float:
         """For computing per-sample loss on an iterable sequence of (x,y) pairs, such as may arise in very
         large streaming datasets from sources that don't fit the random access and known-length requirements of a
         torch.data.Dataset (e.g. a sequence of sentences split from a set of text files as might arise in NLP
         applications.
         This method handles packaging X and y into a batch iterator of the kind that torch modules expect"""
-
+        batch_size = batch_size or self.default_batch_size
         data_kw = dict(batch_size=batch_size, classifier=self.is_classifier,
                        X_encoder=self.encode_input,
                        y_encoder=self.encode_target)
@@ -489,7 +492,8 @@ class TorchModel:
     loss_dataloader = error_dataloader
 
     @training_mode(False)
-    def predict(self, X: Iterable[Any], batch_size: int = DEFAULT_BATCH_SIZE, shuffle: bool=False) -> Iterable[T2]:
+    def predict(self, X: Iterable[Any], batch_size: Opt[int]=None, shuffle: bool=False) -> Iterable[T2]:
+        batch_size = batch_size or self.default_batch_size
         dataset = efficient_batch_iterator(X, X_encoder=self.encode_input, y_encoder=self.encode_input,
                                            batch_size=batch_size, shuffle=shuffle, 
                                            num_workers=self.num_dataloader_workers)
@@ -579,6 +583,9 @@ class TorchSequenceModel(TorchModel):
                  is_classifier: bool=False,
                  flatten_targets: bool=True,
                  estimate_normalization_samples: Opt[int]=None,
+                 default_batch_size: int=DEFAULT_BATCH_SIZE,
+                 stopping_criterion: Callable[[List[float], float], Union[bool, Tuple[bool, Opt[str]]]] =
+                    last_epoch_min_rel_improvement,
                  print_func: Callable[[Any], None]=print, num_dataloader_workers: int=-2):
         super(TorchSequenceModel, self).__init__(torch_module=torch_module, loss_func=loss_func, optimizer=optimizer,
                                                  loss_func_kwargs=loss_func_kwargs, optimizer_kwargs=optimizer_kwargs,
@@ -586,6 +593,8 @@ class TorchSequenceModel(TorchModel):
                                                  target_encoder=target_encoder, output_decoder=output_decoder,
                                                  is_classifier=is_classifier,
                                                  estimate_normalization_samples=estimate_normalization_samples,
+                                                 default_batch_size=default_batch_size,
+                                                 stopping_criterion=stopping_criterion,
                                                  print_func=print_func, num_dataloader_workers=num_dataloader_workers)
 
         self.flatten_targets = flatten_targets
