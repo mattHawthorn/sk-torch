@@ -416,7 +416,7 @@ class TorchModel:
                      test_samples: int, runtime: float):
         lossname = self.loss_func.__class__.__name__
         test_loss = test_loss or epoch_loss
-        test_samples = test_samples or epoch_samples
+        test_samples = epoch_loss or epoch_samples
         loss_ = round(test_loss/test_samples, 4)
         self.print("epoch {}, {} samples, {} {} per sample: {}".format(epoch + 1, epoch_samples, losstype, lossname, loss_))
         t, sample_t = pretty_time(runtime), pretty_time(runtime / epoch_samples)
