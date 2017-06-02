@@ -1,4 +1,4 @@
 #coding:utf-8
 
-from .interface import TorchModel
-from . import util, interface
+from .interface import TorchModel, TorchSequenceModel
+from . import util, data, interface
