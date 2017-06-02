@@ -367,7 +367,8 @@ class TorchModel:
 
         optimizer = self.optimizer
 
-        epoch, epoch_loss, epoch_time, running_samples = 0, 0.0, 0.0, 0
+        epoch, epoch_loss, epoch_time, epoch_samples = 0, 0.0, 0.0, 0
+        test_loss, test_samples = None, None
         epoch_losses = deque(maxlen=epochs_without_improvement)
 
         for epoch in range(max_epochs):
@@ -376,26 +377,26 @@ class TorchModel:
                 self.print("Training epoch {}".format(epoch + 1))
 
             running_loss = 0.0
-            running_samples = 0
+            epoch_samples = 0
             for i, (X_batch, y_batch) in enumerate(batches):
                 batch_start = time()
-                n_samples = X_batch.size()[0]
-                running_samples += n_samples
+                batch_samples = X_batch.size(0)
+                epoch_samples += batch_samples
 
                 err = (self._single_batch_train_pass(X_batch, y_batch, optimizer)).data[0]
                 running_loss += err
                 batch_time = time() - batch_start
 
                 if batch_report_interval and i % batch_report_interval == batch_report_interval - 1:
-                    self.report_batch(epoch, i, err, n_samples, batch_time)
+                    self.report_batch(epoch, i, err, batch_samples, batch_time)
 
             epoch_time = time() - epoch_start
 
             if test_batches is not None:
-                epoch_loss, running_samples = self._error(test_batches)
+                test_loss, test_samples = self._error(test_batches)
 
             if epoch_report_interval and epoch % epoch_report_interval == epoch_report_interval - 1:
-                self.report_epoch(epoch, epoch_loss, losstype, running_samples, epoch_time)
+                self.report_epoch(epoch, epoch_loss, test_loss, losstype, epoch_samples, test_samples, epoch_time)
                 self.print()
 
             epoch_losses.append(epoch_loss)
@@ -403,7 +404,7 @@ class TorchModel:
                 break
 
         if epoch_report_interval:  # and epoch % epoch_report_interval != epoch_report_interval - 1:
-            self.report_epoch(epoch, epoch_loss, losstype, running_samples, epoch_time)
+            self.report_epoch(epoch, epoch_loss, test_loss, losstype, epoch_samples, test_samples, epoch_time)
 
     # aliases
     train = fit
@@ -411,11 +412,14 @@ class TorchModel:
     train_dataloader = fit_dataloader
     update_dataloader = _update
 
-    def report_epoch(self, epoch: int, epoch_loss: float, losstype: str, n_samples: int, runtime: float):
+    def report_epoch(self, epoch: int, epoch_loss: float, test_loss: float, losstype: str, epoch_samples: int,
+                     test_samples: int, runtime: float):
         lossname = self.loss_func.__class__.__name__
-        loss = round(epoch_loss/n_samples, 4)
-        self.print("epoch {}, {} samples, {} {} per sample: {}".format(epoch + 1, n_samples, losstype, lossname, loss))
-        t, sample_t = pretty_time(runtime), pretty_time(runtime / n_samples)
+        test_loss = test_loss or epoch_loss
+        test_samples = epoch_loss or epoch_samples
+        loss_ = round(test_loss/test_samples, 4)
+        self.print("epoch {}, {} samples, {} {} per sample: {}".format(epoch + 1, epoch_samples, losstype, lossname, loss_))
+        t, sample_t = pretty_time(runtime), pretty_time(runtime / epoch_samples)
         self.print("Total runtime: {}  Runtime per sample: {}".format(t, sample_t))
 
     def report_batch(self, epoch: int, batch: int, batch_loss: float, n_samples: int, runtime: float):
