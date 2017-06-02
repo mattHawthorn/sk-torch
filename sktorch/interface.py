@@ -394,16 +394,18 @@ class TorchModel:
 
             if test_batches is not None:
                 test_loss, test_samples = self._error(test_batches)
-
+                epoch_losses.append(test_loss)
+            else:
+                epoch_losses.append(epoch_loss)
+            
             if epoch_report_interval and epoch % epoch_report_interval == epoch_report_interval - 1:
                 self.report_epoch(epoch, epoch_loss, test_loss, losstype, epoch_samples, test_samples, epoch_time)
                 self.print()
 
-            epoch_losses.append(epoch_loss)
             if epoch + 1 >= min_epochs and self.stop_training(epoch_losses, min_rel_improvement):
                 break
 
-        if epoch_report_interval:  # and epoch % epoch_report_interval != epoch_report_interval - 1:
+        if epoch_report_interval and epoch % epoch_report_interval != epoch_report_interval - 1:
             self.report_epoch(epoch, epoch_loss, test_loss, losstype, epoch_samples, test_samples, epoch_time)
 
     # aliases
