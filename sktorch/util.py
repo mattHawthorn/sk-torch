@@ -1,7 +1,6 @@
 #coding:utf-8
-from typing import Tuple, Iterable, Iterator, IO, Union, Optional as Opt
+from typing import Iterable, Iterator, IO, Union
 from os import cpu_count
-from io import BytesIO
 from tempfile import TemporaryFile
 from platform import architecture
 from itertools import islice, chain
@@ -79,24 +78,6 @@ def get_torch_num_workers(num_workers: int):
         print("Warning, `num_workers` is {} but only {} CPU's are available; "
               "using this number instead".format(num_workers, num_cpu))
     return min(num_workers, num_cpu)
-
-
-#####################################################################
-# Stopping criteria                                                 #
-#####################################################################
-
-def last_epoch_min_rel_improvement(epoch_losses: Iterable[float], min_rel_improvement: float) -> Tuple[bool, Opt[str]]:
-    """return value indicates whether the last epoch's loss is at least min_rel_improvement better than all prior
-    epochs, as a proportion of each prior epoch loss."""
-    epoch_losses = list(epoch_losses)
-    prior_losses = epoch_losses[:-1]
-    last_loss = epoch_losses[-1]
-    improvements = [(l - last_loss) / l if l != 0.0 else 0.0 for l in prior_losses]
-    stop = len(prior_losses) > 0 and min_rel_improvement is not None and \
-        all(i < min_rel_improvement for i in improvements)
-    message = "No relative loss improvement greater than {}% over last {} epochs; stopping".format(
-                round(min_rel_improvement * 100.0, 4), len(epoch_losses)) if stop else None
-    return stop, message
 
 
 #####################################################################

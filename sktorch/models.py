@@ -1,26 +1,31 @@
 #coding:utf-8
 
 from torch import nn
+from torch.nn.utils.rnn import PackedSequence
 
 
 # RNN Based Language Model
 class LSTMLanguageModel(nn.Module):
-    def __init__(self, vocab_size: int, embed_size: int, hidden_size: int, num_layers: int=1, tie_weights: bool=False,
+    def __init__(self, vocab_size: int, oov_id: int, embed_size: int, hidden_size: int, num_layers: int=1,
+                 tie_weights: bool=False, batch_first: bool=True,
                  dropout: float=0.0, init_weight_sd: float=0.1,
                  init_forget_gate_bias: float=1.0, init_output_gate_bias: float=1.0):
-        if tie_weights and embed_size != hidden_size:
+        if tie_weights and (embed_size != hidden_size):
             raise ValueError("With tied weights, the embedding dimension must equal the hidden state dimension.")
 
         super(LSTMLanguageModel, self).__init__()
-        self.embed = nn.Embedding(vocab_size + 1, embed_size, padding_idx=vocab_size)
+        self.embeddings = nn.Embedding(vocab_size + 1, embed_size, padding_idx=vocab_size)
         dropout = 0.0 if not dropout else dropout
-        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=batch_first, dropout=dropout)
         self.linear = nn.Linear(hidden_size, vocab_size, bias=True)
 
         self.init_forget_gate_bias = init_forget_gate_bias
         self.init_output_gate_bias = init_output_gate_bias
         self.init_weight_sd = init_weight_sd
 
+        if oov_id is not None and 0 < oov_id >= vocab_size:
+            raise ValueError("oov_id must be between 0 and vocab_size, exclusive")
+        self.oov_id = oov_id
         self.tied = tie_weights
         self.init_weights()
 
@@ -34,7 +39,7 @@ class LSTMLanguageModel(nn.Module):
 
     @property
     def embed_size(self):
-        return self.embed.embedding_dim
+        return self.embeddings.embedding_dim
 
     @property
     def hidden_size(self):
@@ -45,11 +50,11 @@ class LSTMLanguageModel(nn.Module):
         return self.linear.out_features
 
     def init_weights(self):
-        self.embed.weight.data.normal_(0.0, self.init_weight_sd)
+        self.embeddings.weight.data.normal_(0.0, self.init_weight_sd)
         self.linear.bias.data.fill_(0)
 
         if self.tied:
-            self.linear.weight = self.embed.weight
+            self.linear.weight = self.embeddings.weight
         else:
             self.linear.weight.data.normal_(0.0, self.init_weight_sd)
 
@@ -69,9 +74,18 @@ class LSTMLanguageModel(nn.Module):
 
     def lstm_forward(self, x, h=None):
         # Embed word ids to vectors
+        packed = isinstance(x, PackedSequence)
+
         v = self.vocab_size
-        x[x >= v] = v
-        x = self.embed(x)
+        data = x if not packed else x.data
+        if self.oov_id is not None:
+            data[data >= v] = self.oov_id
+            data[data < 0] = self.oov_id
+
+        if packed:
+            x = PackedSequence(self.embeddings(data), x.batch_sizes)
+        else:
+            x = self.embeddings(data)
 
         # Forward propagate RNN
         out, hc = self.lstm(x, h)
@@ -91,10 +105,17 @@ class LSTMLanguageModel(nn.Module):
 
     def forward(self, x, h=None):
         out, h = self.lstm_forward(x, h)
-        # Reshape output to (batch_size*sequence_length, hidden_size)
-        batch, seq_len = out.size(0), out.size(1)
-        out = out.contiguous().view(batch * seq_len, self.hidden_size)
 
-        # Decode hidden states of all time steps
-        out = self.linear(out)  # .view(batch, seq_len, self.V)
+        packed = isinstance(out, PackedSequence)
+
+        if packed:
+            data = out.data
+            out = PackedSequence(self.linear(data))
+        else:
+            # Reshape output to (batch_size*sequence_length, hidden_size)
+            batch, seq_len = out.size(0), out.size(1)
+            data = out.contiguous().view(batch * seq_len, self.hidden_size)
+            # Decode hidden states of all time steps
+            out = self.linear(data).view(batch, seq_len, self.vocab_size)
+
         return out

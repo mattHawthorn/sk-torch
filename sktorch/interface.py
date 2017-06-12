@@ -1,19 +1,20 @@
 #coding:utf-8
 
 from typing import Any, Tuple, List, Iterable, Callable, Union, IO, Optional as Opt
-from collections import deque
 import pickle
 from time import time
 from numpy import ndarray
 from torch import autograd, nn, optim, from_numpy, stack
 from torch.nn.modules import loss
 from torch.nn.utils import clip_grad_norm
-from .util import cuda_available, peek, pretty_time, last_epoch_min_rel_improvement
+from .util import cuda_available, peek, pretty_time
 from .util import get_torch_object_bytes, load_torch_object_bytes, open_file
+from .stopping import max_generalization_loss#, tail_losses_n_consecutive_increases, tail_losses_no_relative_improvement
 from .data import efficient_batch_iterator, TupleIteratorDataLoader
 from .data import T1, T2, TensorType, FloatTensorType, FloatTensorTypes
 
 DEFAULT_BATCH_SIZE = 32
+DEFAULT_STOPPING_CRITERION = max_generalization_loss(0.05)
 
 
 def training_mode(mode: bool):
@@ -41,8 +42,8 @@ class TorchModel:
                  is_classifier: bool=False,
                  estimate_normalization_samples: Opt[int]=None,
                  default_batch_size: int=DEFAULT_BATCH_SIZE,
-                 stopping_criterion: Callable[[List[float], float], Union[bool, Tuple[bool, Opt[str]]]]=
-                    last_epoch_min_rel_improvement,
+                 stopping_criterion: Callable[[List[float], Opt[List[float]]], Union[bool, Tuple[bool, Opt[str]]]]=
+                    DEFAULT_STOPPING_CRITERION,
                  print_func: Callable[[Any], None]=print,
                  num_dataloader_workers: int=-2):
         """
@@ -52,7 +53,7 @@ class TorchModel:
         :param input_encoder: a callable taking the type of the training data independent variable and encoding it to
             tensors for the forward pass in the torch module
         :param target_encoder: a callable taking the type of the training data dependent variable and encoding it to
-            tensors for the forward pass in the torch module
+            tensors or numerics for the forward pass in the torch module
         :param output_decoder: a callable taking a (single instance, not batch) torch tensor output of the torch module
             forward pass, and returning the type of the training data dependent variable
         :param estimate_normalization_samples: If normalization of inputs is called for, use this many samples of
@@ -60,10 +61,9 @@ class TorchModel:
         :param is_classifier: boolean specifying that the target is a single class. This is required to make sure that
             dependent variable batches are collated in the way that torch loss functions expect (1-dimensional)
         :param print_func: callable with no return value, ideally prints to screen or log file
-        :param stopping_criterion: callable taking a list of epoch losses and a float criterion and returning either a
-            bool or (bool, str or None). The float criterion semantically indicates some 'minimal goodness' or
-            'maximal badness' allowed of the sequence of epoch losses. The return bool should indicate whether to
-            stop training. The optional return string is a message to be printed at the time that training is stopped.
+        :param stopping_criterion: callable taking a list of epoch losses and optional validation losses and returning
+            either a bool or (bool, str or None). The return bool should indicate whether to stop training.
+            The optional return string is a message to be printed at the time that training is stopped.
         :param num_dataloader_workers: int specifying how many threads should be used for data loading. 0 indicates that
             all data loading is done in the main thread (same semantics as torch.utils.data.Dataloader). A negative
             value indicates (available cpu's + num_dataloader_workers + 1) - same semantics as often used in sklearn.
@@ -237,11 +237,13 @@ class TorchModel:
 
     @training_mode(True)
     def fit(self, X: Iterable[T1], y: Iterable[T2], X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
-            batch_size: Opt[int]=None, shuffle: bool=False, max_epochs: int=1,
-            min_epochs: int=1, min_rel_improvement: float=1e-5, epochs_without_improvement: int=5,
+            batch_size: Opt[int]=None, shuffle: bool=False,
+            max_epochs: int=1, min_epochs: int=1, criterion_window: int=5,
+            max_training_time: Opt[float]=None,
             batch_report_interval: Opt[int]=None, epoch_report_interval: Opt[int]=None):
         """This method fits the *entire* pipeline, including input normalization. Initialization of weight/bias
-        parameters in the torch_module is up to you; there is no obvious canonical way to do it here."""
+        parameters in the torch_module is up to you; there is no obvious canonical way to do it here.
+        Returns per-epoch losses and validation losses (if any)."""
         batch_size = batch_size or self.default_batch_size
         if self.should_normalize:
             sample, X = peek(X, self.norm_n_samples)
@@ -250,21 +252,21 @@ class TorchModel:
             sample = stack(sample)
             self.estimate_normalization(sample)
 
-        self.update(X=X, y=y, X_test=X_test, y_test=y_test,
-                    batch_size=batch_size, shuffle=shuffle,
-                    max_epochs=max_epochs, min_epochs=min_epochs,
-                    min_rel_improvement=min_rel_improvement,
-                    epochs_without_improvement=epochs_without_improvement,
-                    batch_report_interval=batch_report_interval,
-                    epoch_report_interval=epoch_report_interval)
+        return self.update(X=X, y=y, X_test=X_test, y_test=y_test, batch_size=batch_size, shuffle=shuffle,
+                           max_epochs=max_epochs, min_epochs=min_epochs,
+                           criterion_window=criterion_window,
+                           max_training_time=max_training_time,
+                           batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
 
     @training_mode(True)
     def update(self, X: Iterable[T1], y: Iterable[T2], X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
-               batch_size: Opt[int] = None, shuffle: bool=False, max_epochs: int=1,
-               min_epochs: int=1, min_rel_improvement: Opt[float]=1e-5, epochs_without_improvement: int=5,
+               batch_size: Opt[int] = None, shuffle: bool=False,
+               max_epochs: int = 1, min_epochs: int = 1, criterion_window: int = 5,
+               max_training_time: Opt[float] = None,
                batch_report_interval: Opt[int]=None, epoch_report_interval: Opt[int]=None):
         """Update model parameters in light of new data X and y.
-        This method handles packaging X and y into a batch iterator of the kind that torch modules expect"""
+        Returns per-epoch losses and validation losses (if any).
+        This method handles packaging X and y into a batch iterator of the kind that torch modules expect."""
         assert max_epochs > 0
         batch_size = batch_size or self.default_batch_size
         data_kw = dict(X_encoder=self.encode_input, y_encoder=self.encode_target,
@@ -279,21 +281,23 @@ class TorchModel:
                 self.print("Warning: test data was provided but either the regressors or the response were omitted")
             test_data = None
 
-        self._update(dataset, test_data, max_epochs=max_epochs, min_epochs=min_epochs, min_rel_improvement=min_rel_improvement,
-                     epochs_without_improvement=epochs_without_improvement, batch_report_interval=batch_report_interval,
-                     epoch_report_interval=epoch_report_interval)
+        return self._update(dataset, test_data, max_epochs=max_epochs, min_epochs=min_epochs,
+                            criterion_window=criterion_window,
+                            max_training_time=max_training_time,
+                            batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
 
     @training_mode(True)
     def fit_zipped(self, dataset: Iterable[Tuple[T1, T2]], test_dataset: Opt[Iterable[Tuple[T1, T2]]]=None,
-                   batch_size: Opt[int] = None, max_epochs: int = 1,
-                   min_epochs: int = 1, min_rel_improvement: float = 1e-5, epochs_without_improvement: int = 5,
+                   batch_size: Opt[int] = None,
+                   max_epochs: int = 1, min_epochs: int = 1, criterion_window: int = 5,
+                   max_training_time: Opt[float] = None,
                    batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
         """For fitting to an iterable sequence of pairs, such as may arise in very large streaming datasets from sources
         that don't fit the random access and known-length requirements of a torch.data.Dataset (e.g. a sequence of
         sentences split from a set of text files as might arise in NLP applications.
         Like TorchModel.fit(), this estimates input normalization before the weight update, and weight initialization of
-        the torch_module is up to you.
-        This method handles packaging X and y into a batch iterator of the kind that torch modules expect"""
+        the torch_module is up to you. Returns per-epoch losses and validation losses (if any).
+        This method handles packaging X and y into a batch iterator of the kind that torch modules expect."""
         batch_size = batch_size or self.default_batch_size
         if self.should_normalize:
             sample, dataset = peek(dataset, self.norm_n_samples)
@@ -303,20 +307,22 @@ class TorchModel:
             sample = stack(sample)
             self.estimate_normalization(sample)
 
-        self.update_zipped(dataset=dataset, test_dataset=test_dataset, batch_size=batch_size,
-                           max_epochs=max_epochs, min_epochs=min_epochs, min_rel_improvement=min_rel_improvement,
-                           epochs_without_improvement=epochs_without_improvement,
-                           batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
+        return self.update_zipped(dataset=dataset, test_dataset=test_dataset, batch_size=batch_size,
+                                  max_epochs=max_epochs, min_epochs=min_epochs,
+                                  criterion_window=criterion_window,
+                                  max_training_time=max_training_time,
+                                  batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
 
     @training_mode(True)
     def update_zipped(self, dataset: Iterable[Tuple[T1, T2]], test_dataset: Opt[Iterable[Tuple[T1, T2]]]=None,
-                      batch_size: Opt[int] = None, max_epochs: int = 1,
-                      min_epochs: int = 1, min_rel_improvement: Opt[float] = 1e-5, epochs_without_improvement: int = 5,
+                      batch_size: Opt[int] = None,
+                      max_epochs: int = 1, min_epochs: int = 1, criterion_window: int = 5,
+                      max_training_time: Opt[float] = None,
                       batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
         """For updating model parameters in light of an iterable sequence of (x,y) pairs, such as may arise in very
         large streaming datasets from sources that don't fit the random access and known-length requirements of a
         torch.data.Dataset (e.g. a sequence of sentences split from a set of text files as might arise in NLP
-        applications."""
+        applications. Returns per-epoch losses and validation losses (if any)"""
         batch_size = batch_size or self.default_batch_size
         data_kw = dict(batch_size=batch_size, classifier=self.is_classifier,
                        X_encoder=self.encode_input,
@@ -327,20 +333,23 @@ class TorchModel:
         if test_dataset is not None:
             test_dataset = TupleIteratorDataLoader(test_dataset, **data_kw)
 
-        self._update(dataset, test_dataset, max_epochs=max_epochs, min_epochs=min_epochs,
-                     min_rel_improvement=min_rel_improvement, epochs_without_improvement=epochs_without_improvement,
-                     batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
+        return self._update(dataset, test_dataset, max_epochs=max_epochs, min_epochs=min_epochs,
+                            criterion_window=criterion_window,
+                            max_training_time=max_training_time,
+                            batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
 
     @training_mode(True)
-    def fit_dataloader(self, batches: Iterable[Tuple[TensorType, TensorType]],
-                       test_batches: Opt[Iterable[Tuple[TensorType, TensorType]]],
+    def fit_batched(self, batches: Iterable[Tuple[TensorType, TensorType]],
+                       test_batches: Opt[Iterable[Tuple[TensorType, TensorType]]]=None,
                        max_epochs: int = 1, min_epochs: int = 1,
-                       min_rel_improvement: Opt[float] = 1e-5, epochs_without_improvement: int = 5,
+                       criterion_window: int = 5,
+                       max_training_time: Opt[float] = None,
                        batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
         """For fitting to an iterable of batch tensor pairs, such as would come from a torch.util.data.DataLoader.
         Variables are therefore assumed to be already appropriately encoded, and none of the provided encoders is used.
         The test set is also assumed to be in this form. Like TorchModel.fit(), this estimates input normalization
-        before the weight update, and weight initialization of the torch_module is up to you."""
+        before the weight update, and weight initialization of the torch_module is up to you.
+        Returns per-epoch losses and validation losses (if any)"""
 
         if self.should_normalize:
             sample = []
@@ -354,75 +363,107 @@ class TorchModel:
             sample = stack(sample)
             self.estimate_normalization(sample)
 
-        self._update(batches=batches, test_batches=test_batches, max_epochs=max_epochs, min_epochs=min_epochs,
-                     min_rel_improvement=min_rel_improvement, epochs_without_improvement=epochs_without_improvement,
-                     batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
+        return self._update(batches=batches, test_batches=test_batches, max_epochs=max_epochs, min_epochs=min_epochs,
+                            criterion_window=criterion_window,
+                            max_training_time=max_training_time,
+                            batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
 
-    def _update(self, batches: Iterable[Tuple[TensorType, TensorType]], test_batches: Opt[Iterable[Tuple[TensorType, TensorType]]],
-                max_epochs: int = 1, min_epochs: int = 1, min_rel_improvement: Opt[float] = 1e-5, epochs_without_improvement: int = 5,
+    @training_mode(True)
+    def _update(self, batches: Iterable[Tuple[TensorType, TensorType]],
+                test_batches: Opt[Iterable[Tuple[TensorType, TensorType]]]=None,
+                max_epochs: int = 1, min_epochs: int = 1,
+                criterion_window: Opt[int] = 5,
+                max_training_time: Opt[float]=None,
                 batch_report_interval: Opt[int] = None, epoch_report_interval: Opt[int] = None):
         # all training ultimately ends up here
-        if test_batches is None:
-            losstype = 'training'
-        else:
-            losstype = 'validation'
-
         optimizer = self.optimizer
 
-        epoch, epoch_loss, epoch_time, epoch_samples = 0, 0.0, 0.0, 0
-        test_loss, test_samples = None, None
-        epoch_losses = deque(maxlen=epochs_without_improvement)
+        epoch, epoch_loss, epoch_time, epoch_samples, training_time = 0, 0.0, 0.0, 0, 0.0
+        test_loss, test_samples, best_test_loss, best_model = None, None, float('inf'), None
+        epoch_losses = []#deque(maxlen=epochs_without_improvement + 1)
 
-        for epoch in range(max_epochs):
+        if test_batches is not None:
+            loss_type = 'validation'
+            test_losses = []#deque(maxlen=epochs_without_improvement + 1)
+        else:
+            loss_type = 'training'
+            test_losses = None
+
+        def tail(losses):
+            if losses is not None:
+                return losses if criterion_window is None else losses[-min(criterion_window, len(losses)):]
+            else:
+                return losses
+
+
+        for epoch in range(1, max_epochs + 1):
             epoch_start = time()
-            if epoch_report_interval and epoch % epoch_report_interval == epoch_report_interval - 1:
-                self.print("Training epoch {}".format(epoch + 1))
+            if epoch_report_interval and epoch % epoch_report_interval == 0:
+                self.print("Training epoch {}".format(epoch))
 
-            running_loss = 0.0
+            epoch_loss = 0.0
             epoch_samples = 0
-            for i, (X_batch, y_batch) in enumerate(batches):
+            for i, (X_batch, y_batch) in enumerate(batches, 1):
                 batch_start = time()
-                batch_samples = X_batch.size(0)
-                epoch_samples += batch_samples
-
-                err = (self._single_batch_train_pass(X_batch, y_batch, optimizer)).data[0]
-                running_loss += err
+                batch_loss, batch_samples = self._batch_inner_block(X_batch, y_batch, optimizer)
                 batch_time = time() - batch_start
 
-                if batch_report_interval and i % batch_report_interval == batch_report_interval - 1:
-                    self.report_batch(epoch, i, err, batch_samples, batch_time)
+                epoch_samples += batch_samples
+                epoch_loss += batch_loss
+
+                if batch_report_interval and i % batch_report_interval == 0:
+                    self.report_batch(epoch, i, batch_loss, batch_samples, batch_time)
 
             epoch_time = time() - epoch_start
+            epoch_losses.append(epoch_loss / epoch_samples)
+            training_time += epoch_time
 
             if test_batches is not None:
                 test_loss, test_samples = self._error(test_batches)
-                epoch_losses.append(test_loss)
-            else:
-                epoch_losses.append(epoch_loss)
-            
-            if epoch_report_interval and epoch % epoch_report_interval == epoch_report_interval - 1:
-                self.report_epoch(epoch, epoch_loss, test_loss, losstype, epoch_samples, test_samples, epoch_time)
-                self.print()
+                test_losses.append(test_loss / test_samples)
 
-            if epoch + 1 >= min_epochs and self.stop_training(epoch_losses, min_rel_improvement):
+            if epoch_report_interval and epoch % epoch_report_interval == 0:
+                self.report_epoch(epoch, epoch_loss, test_loss, loss_type, epoch_samples, test_samples, epoch_time)
+
+            if test_batches is not None and test_loss <= best_test_loss:
+                self.print("New optimal {} loss; saving parameters".format(loss_type))
+                best_test_loss = test_loss
+                best_model = get_torch_object_bytes(self.torch_module)
+
+            self.print()
+            if epoch >= min_epochs and (self.stop_training(tail(epoch_losses), tail(test_losses)) or
+                                            (max_training_time is not None and training_time >= max_training_time)):
                 break
 
-        if epoch_report_interval and epoch % epoch_report_interval != epoch_report_interval - 1:
-            self.report_epoch(epoch, epoch_loss, test_loss, losstype, epoch_samples, test_samples, epoch_time)
 
+        if test_batches is not None:
+            self.print("Loading parameters of {}-optimal model".format(loss_type))
+            self.torch_module = load_torch_object_bytes(best_model)
+
+        if epoch_report_interval and epoch % epoch_report_interval != 0:
+            self.report_epoch(epoch, epoch_loss, test_loss, loss_type, epoch_samples, test_samples, epoch_time)
+
+        return epoch_losses, test_losses
+
+    def _batch_inner_block(self, X_batch, y_batch, optimizer):
+        # factored out to allow customization for more complex models, e.g. seqence models
+        batch_samples = X_batch.size(0)
+        batch_loss = (self._single_batch_train_pass(X_batch, y_batch, optimizer)).data[0]
+        return batch_loss, batch_samples
+    
     # aliases
     train = fit
     train_zipped = fit_zipped
-    train_dataloader = fit_dataloader
-    update_dataloader = _update
+    train_batched = fit_batched
+    update_batched = _update
 
-    def report_epoch(self, epoch: int, epoch_loss: float, test_loss: float, losstype: str, epoch_samples: int,
+    def report_epoch(self, epoch: int, epoch_loss: float, test_loss: float, loss_type: str, epoch_samples: int,
                      test_samples: int, runtime: float):
         lossname = self.loss_func.__class__.__name__
         test_loss = test_loss or epoch_loss
         test_samples = test_samples or epoch_samples
         loss_ = round(test_loss/test_samples, 4)
-        self.print("epoch {}, {} samples, {} {} per sample: {}".format(epoch + 1, epoch_samples, losstype, lossname, loss_))
+        self.print("epoch {}, {} samples, {} {} per sample: {}".format(epoch, epoch_samples, loss_type, lossname, loss_))
         t, sample_t = pretty_time(runtime), pretty_time(runtime / epoch_samples)
         self.print("Total runtime: {}  Runtime per sample: {}".format(t, sample_t))
 
@@ -431,10 +472,12 @@ class TorchModel:
         sample_t = pretty_time(runtime / n_samples)
         loss = round(batch_loss/n_samples, 4)
         self.print("epoch {}, batch {}, {} samples, runtime per sample: {}, {} per sample: {}"
-                   "".format(epoch + 1, batch + 1, n_samples, sample_t, lossname, loss))
+                   "".format(epoch, batch, n_samples, sample_t, lossname, loss))
 
-    def stop_training(self, epoch_losses: Iterable[float], min_rel_improvement: float) -> bool:
-        tup = self.stopping_criterion(list(epoch_losses), min_rel_improvement)
+    def stop_training(self, epoch_losses: Iterable[float], test_losses: Opt[Iterable[float]]) -> bool:
+        if test_losses is not None:
+            test_losses = list(test_losses)
+        tup = self.stopping_criterion(list(epoch_losses), test_losses)
         if isinstance(tup, tuple):
             stop, stop_msg = tup[0:2]
         else:
@@ -443,6 +486,41 @@ class TorchModel:
             if stop_msg:
                 self.print(stop_msg)
         return stop
+
+    def plot_training_loss(self, training_losses: List[float], validation_losses: Opt[List[float]]=None,
+                           loss_name: Opt[str]=None, model_name: Opt[str]=None,
+                           title: Opt[str]=None, training_marker: str='bo--', validation_marker: str='ro--',
+                           ylim: Opt[Tuple[float, float]]=None,
+                           return_fig: bool=True):
+        """Plot training and validation losses as would be returned by a .fit*(...) call.
+        Pass optional title, markers, loss function name and model name for customization.
+        If return_fig is True (default), the figure object is returned for further customization, saving to a file,
+        etc., otherwise the plot is displayed and nothing is returned."""
+        try:
+            from matplotlib import pyplot as plt
+        except Exception as e:
+            raise e
+        else:
+            plt.rcParams['figure.figsize'] = 8, 8
+            fig, ax = plt.subplots()
+            loss_name = loss_name or self.loss_func.__class__.__name__
+            model_name = model_name or self.torch_module.__class__.__name__
+            x = list(range(1, len(training_losses) + 1))
+            ax.plot(x, training_losses, training_marker, label="training {}".format(loss_name))
+            if validation_losses is not None:
+                ax.plot(x, validation_losses, validation_marker, label="validation {}".format(loss_name))
+            ax.set_title(title or "{} {} per sample by training epoch".format(model_name, loss_name))
+            ax.set_xlabel("epoch")
+            ax.set_ylabel(loss_name)
+            ax.set_xticks(x)
+            ax.legend(loc=1)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+            if return_fig:
+                plt.show(fig)
+            else:
+                return fig
+
 
     @training_mode(False)
     def error(self, X: Iterable[T1], y: Iterable[T2], batch_size: Opt[int]=None, shuffle: bool=False) -> float:
@@ -470,7 +548,7 @@ class TorchModel:
         return err / n_samples
 
     @training_mode(False)
-    def error_dataloader(self, batches: Iterable[Tuple[TensorType, TensorType]]):
+    def error_batched(self, batches: Iterable[Tuple[TensorType, TensorType]]):
         """For computing loss on an iterable of batch tensor pairs, such as would come from a torch.util.data.DataLoader.
         Variables are therefore assumed to be already appropriately encoded, and none of the provided encoders is used.
         """
@@ -489,7 +567,7 @@ class TorchModel:
     # aliases
     loss = error
     loss_zipped = error_zipped
-    loss_dataloader = error_dataloader
+    loss_batched = error_batched
 
     @training_mode(False)
     def predict(self, X: Iterable[Any], batch_size: Opt[int]=None, shuffle: bool=False) -> Iterable[T2]:
@@ -500,13 +578,13 @@ class TorchModel:
         return self._predict(dataset)
 
     @training_mode(False)
-    def predict_dataloader(self, batches: Iterable[Tuple[TensorType, TensorType]]):
+    def predict_batched(self, batches: Iterable[Tuple[TensorType, TensorType]]):
         return self._predict(batches)
 
     def _predict(self, batches: Iterable[Tuple[TensorType, TensorType]]) -> Iterable[T2]:
         for X_batch, _ in batches:
             for output in self._single_batch_forward_pass(X_batch):
-                yield self.decode_output(output)
+                yield self.decode_output(output.data)
     
     @staticmethod
     def encode_input(X: T1) -> TensorType:
@@ -571,6 +649,48 @@ class TorchModel:
             self.__dict__.__setitem__(k, value)
 
 
+class TorchClassifierModel(TorchModel):
+    """Wrapper class to handle encoding inputs to pytorch variables, managing transfer to/from the GPU,
+    handling train/eval mode, etc."""
+    def __init__(self, torch_module: nn.Module, loss_func: Union[loss._Loss, type, str],
+                 optimizer: Union[str, optim.Optimizer],
+                 classes: List[T2],
+                 loss_func_kwargs: Opt[dict]=None,
+                 optimizer_kwargs: Opt[dict]=None,
+                 input_encoder: Opt[Callable[[T1], TensorType]]=None,
+                 estimate_normalization_samples: Opt[int]=None,
+                 default_batch_size: int=DEFAULT_BATCH_SIZE,
+                 stopping_criterion: Callable[[List[float], Opt[List[float]]], Union[bool, Tuple[bool, Opt[str]]]]=
+                    DEFAULT_STOPPING_CRITERION,
+                 print_func: Callable[[Any], None]=print,
+                 num_dataloader_workers: int=-2):
+        class_to_int = dict(zip(classes, range(len(classes))))
+        int_to_class = dict(map(reversed, class_to_int.items()))
+        target_encoder = class_to_int.__getitem__
+        self.class_to_int = class_to_int
+        self.int_to_class = int_to_class
+        self.num_classes = len(class_to_int)
+        super(TorchClassifierModel, self).__init__(torch_module=torch_module, loss_func=loss_func, optimizer=optimizer,
+                                                   loss_func_kwargs=loss_func_kwargs, optimizer_kwargs=optimizer_kwargs,
+                                                   input_encoder=input_encoder, target_encoder=target_encoder,
+                                                   output_decoder=self._get_classes,
+                                                   is_classifier=True,
+                                                   estimate_normalization_samples=estimate_normalization_samples,
+                                                   default_batch_size=default_batch_size,
+                                                   stopping_criterion=stopping_criterion,
+                                                   print_func=print_func, num_dataloader_workers=num_dataloader_workers)
+
+    def _get_classes(self, preds: FloatTensorType):
+        # works for a batch or a single instance
+        dim = preds.ndimension()
+        decode = self.int_to_class.__getitem__
+        if dim == 2:
+            ids = preds.max(1)[1].squeeze(1)
+            return list(map(decode, ids))
+        elif dim == 1:
+            return decode(preds.max(0)[1][0])
+
+
 class TorchSequenceModel(TorchModel):
     def __init__(self, torch_module: nn.Module, loss_func: loss._Loss,
                  optimizer: optim.Optimizer,
@@ -582,10 +702,12 @@ class TorchSequenceModel(TorchModel):
                  clip_grad_norm: Opt[float]=None,
                  is_classifier: bool=False,
                  flatten_targets: bool=True,
+                 flatten_output: bool=True,
+                 bptt_len: int=20,
                  estimate_normalization_samples: Opt[int]=None,
                  default_batch_size: int=DEFAULT_BATCH_SIZE,
-                 stopping_criterion: Callable[[List[float], float], Union[bool, Tuple[bool, Opt[str]]]] =
-                    last_epoch_min_rel_improvement,
+                 stopping_criterion: Callable[[List[float], Opt[List[float]]], Union[bool, Tuple[bool, Opt[str]]]] =
+                    DEFAULT_STOPPING_CRITERION,
                  print_func: Callable[[Any], None]=print, num_dataloader_workers: int=-2):
         super(TorchSequenceModel, self).__init__(torch_module=torch_module, loss_func=loss_func, optimizer=optimizer,
                                                  loss_func_kwargs=loss_func_kwargs, optimizer_kwargs=optimizer_kwargs,
@@ -598,7 +720,9 @@ class TorchSequenceModel(TorchModel):
                                                  print_func=print_func, num_dataloader_workers=num_dataloader_workers)
 
         self.flatten_targets = flatten_targets
+        self.flatten_output = flatten_output
         self.clip_grad_norm = clip_grad_norm
+        self.bptt_len = bptt_len
 
     @property
     def clip_grad(self):
@@ -619,8 +743,18 @@ class TorchSequenceModel(TorchModel):
         if self.flatten_targets:
             y_batch = y_batch.view(-1)
         output = self._single_batch_forward_pass(X_batch)
+        output = self._flatten_output(output)
         err = self.loss_func(output, y_batch)
         return err
+
+    def _flatten_output(self, output: TensorType):
+        size = output.size()
+        if len(size) == 3 and self.flatten_output:
+            output = output.view(size[0]*size[1], size[2])
+        elif len(size) != 2:
+            raise ValueError("Output of torch_module.forward() must be 2 or 3 dimensional, "
+                             "corresponding to either (batch*seq, vocab) or (batch, seq, vocab)")
+        return output
 
     def _single_batch_forward_pass(self, X_batch: TensorType):
         X_batch = self.prepare_input(X_batch)
@@ -642,8 +776,16 @@ class TorchSequenceModel(TorchModel):
 
     # note: TorchModel.normalize should still work since Tensor.expand_as does what we hope it would do
 
+    def _predict(self, batches: Iterable[Tuple[TensorType, TensorType]]) -> Iterable[T2]:
+        # each X_batch is assumed to be of shape (batch, seq) or (batch, seq, features)
+        for X_batch, _ in batches:
+            for output in self._single_batch_forward_pass(X_batch):
+                yield self.decode_output(output.data)
+
     def _init_dict(self):
         d = super(TorchSequenceModel, self)._init_dict()
         d['flatten_targets'] = self.flatten_targets
+        d['flatten_output'] = self.flatten_output
         d['clip_grad_norm'] = self.clip_grad_norm
+        d['bptt_len'] = self.bptt_len
         return d
