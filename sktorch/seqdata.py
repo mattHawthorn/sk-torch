@@ -8,7 +8,7 @@ from typing import Iterable, List, Dict, Tuple, Iterator, Optional as Opt, Seque
 from torch import stack
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import Dataset
-from torch.utils.data.dataloader import default_collate
+# from torch.utils.data.dataloader import default_collate
 
 from .data import H, T1, str_to_int_tensor_type, IntTensorType, FloatTensorType, NumericTensorTypes
 
