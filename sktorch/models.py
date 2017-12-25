@@ -1,7 +1,52 @@
 #coding:utf-8
 
-from torch import nn
+from typing import Union, Optional as Opt
+from numpy import ndarray
+from torch import nn, sigmoid, log
 from torch.nn.utils.rnn import PackedSequence
+from .data import NegativeSampler
+from calm.processor import ngramIter
+
+
+class BilinearFactorModel(nn.Module, NegativeSampler):
+    def __init__(self, n_input_classes: int, output_dist: Union[int, ndarray],
+                 embedding_dim: int, n_neg_samlples: int = 5,
+                 neg_sampling_exponent: Opt[float] = None):
+        nn.Module.__init__(self)
+        NegativeSampler.__init__(self, output_dist = output_dist, n_neg_samlples = n_neg_samlples,
+                                 neg_sampling_exponent = neg_sampling_exponent)
+
+        assert isinstance(embedding_dim, int) and embedding_dim > 0, "`embedding_dim` must be a positive int"
+        self.embedding_dim = embedding_dim
+        assert isinstance(n_input_classes, int) and n_input_classes > 0, "`n_input_classes` must be a positive int"
+
+        self.input_embeddings = nn.Embedding(n_input_classes, self.embedding_dim, sparse=True)
+        self.output_embeddings = nn.Embedding(self.n_output_classes, self.embedding_dim, sparse=True)
+        self.NCELoss = NCELoss()
+
+    @property
+    def n_output_classes(self):
+        return len(self.output_dist)
+
+    @property
+    def n_input_classes(self):
+        return self.input_embeddings.num_embeddings
+
+    def forward(self, in_out_pairs):
+        # input is batch_size*2 int Variable
+        i = self.input_embeddings(in_out_pairs[:, 0])
+        o = self.output_embeddings(in_out_pairs[:, 1])
+        # raw activations, NCE_Loss handles the sigmoid (we need to know classes to know the sign to apply)
+        return (i * o).sum(1).squeeze()
+
+
+class NCELoss(nn.Module):
+    def forward(self, activations, targets):
+        # targets are -1.0 or 1.0, 1-d Variable
+        # likelihood assigned by the model to pos and neg samples is given by the sigmoid, with the sign
+        # determined by the class.
+        # negative log likelihood
+        return log(sigmoid(activations * targets)).sum() * -1.0
 
 
 class LSTMMixin(nn.Module):

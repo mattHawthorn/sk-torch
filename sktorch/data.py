@@ -4,10 +4,10 @@ from random import sample
 from typing import Sequence as Seq, Optional as Opt
 from typing import Union, Tuple, Iterable, Hashable, Callable, TypeVar
 
-from numpy import ndarray, finfo, abs as np_abs
+from numpy import array, ndarray, full, float32, finfo, abs as np_abs, all as np_all
 from torch import HalfTensor, FloatTensor, DoubleTensor, ByteTensor, CharTensor, ShortTensor, IntTensor, LongTensor, _TensorBase
 from torch import from_numpy
-from torch import stack
+from torch import stack, cat, multinomial, ones
 from torch.autograd import Variable
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.data.dataloader import default_collate
@@ -44,6 +44,65 @@ str_to_int_tensor_type = {'int': get_default_int_size(),
 
 def Identity(X: T1) -> T1:
     return X
+
+
+#####################################################################
+# Sampling                                                          #
+#####################################################################
+
+class NegativeSampler:
+    def __init__(self, output_dist: Union[int, ndarray],
+                 n_neg_samlples: int = 5,
+                 neg_sampling_exponent: Opt[float] = None):
+        assert isinstance(n_neg_samlples, int) and n_neg_samlples > 0, "`n_neg_samples` must be a positive int"
+        if neg_sampling_exponent is not None:
+            neg_sampling_exponent = float(neg_sampling_exponent)
+            assert 0.0 <= neg_sampling_exponent <= 1.0, "`neg_sampling_exponent` must be a float between 0 and 1."
+
+        self.n_neg_samples = n_neg_samlples
+        self.neg_sampling_exponent = neg_sampling_exponent or 1.0
+
+        def tensor_distribution(dist: Union[int, ndarray], exponent: float) -> FloatTensor:
+            if isinstance(dist, int):
+                n = dist
+                weights = from_numpy(full(n, 1.0/n, dtype=float32))
+                if exponent != 1.0:
+                    print("Warning: negative sampling exponent has no effect when a distribution is not "
+                          "explicitly given; the uniform distribution will be used.")
+            elif isinstance(dist, ndarray):
+                dist = array(dist, dtype=float32)  # in case dist is a np.matrix, which complicates squeezing
+                if dist.ndim != 1 and dist.shape.count(1) < dist.ndim - 1:
+                    raise ValueError("if an array, `input/output_dist` must be squeezeable to a 1-dimensional "
+                                     "array.")
+                assert np_all(dist >= 0), "`input/output_dist`, if given as an array, must have nonnegative entries."
+                dist **= exponent
+                dist /= dist.sum()
+                weights = from_numpy(dist)
+            else:
+                raise TypeError("`input/output_dist` must be an int representing the number of classes or a "
+                                "numpy array of positive numbers that is squeezeable to a 1-dimensional array.")
+            return weights
+
+        self.output_dist = tensor_distribution(output_dist, self.neg_sampling_exponent)
+
+    def neg_samples(self, batch_size: int):
+        n_samples = batch_size * self.n_neg_samples
+        return multinomial(self.output_dist, num_samples=n_samples, replacement=True)
+
+    def encode_input(self, in_out_pairs: ArrayType) -> IntTensorType:
+        # in_out_pairs is assumed to be an n x 2 array-like
+        tens = to_tensor(in_out_pairs)
+        assert tens.size(1) == 2
+        batch_size = tens.size(0)
+        neg_samples = stack([tens[:, 0].repeat(self.n_neg_samples), self.neg_samples(batch_size)], 1)
+        return cat([tens, neg_samples])
+
+    def encode_target(self, in_out_pairs: ArrayType) -> FloatTensor:
+        # in_out_pairs is assumed to be an n x 2 array-like
+        batch_size = in_out_pairs.size(0)
+        classes = ones(batch_size * (self.n_neg_samples + 1))
+        classes[self.n_neg_samples:] *= -1.0
+        return classes
 
 
 #####################################################################
@@ -121,8 +180,7 @@ def efficient_batch_iterator(X: Iterable[T1], y: Opt[Iterable[T2]]=None,
             # encoders should take batch tensors in this instance
             dataset = TensorDataset(to_tensor(X), to_tensor(y))
             return MappedDataLoader(X_encoder=X_encoder, y_encoder=y_encoder, dataset=dataset, batch_size=batch_size,
-                                    shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn,
-                                    classifier=classifier)
+                                    shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn)
     elif isinstance(X, Seq) or (hasattr(X, '__len__') and hasattr(X, '__getitem__')):
         if isinstance(y, Seq) or (hasattr(y, '__len__') and hasattr(y, '__getitem__')):
             # Seq has __len__ and __getitem__ so it can serve as a dataset

@@ -200,15 +200,15 @@ class TorchModel:
     def loss_func(self, loss_func):
         if isinstance(loss_func, str):
             loss_func = getattr(loss, loss_func)
-        if isinstance(loss_func, loss._Loss):
+        if isinstance(loss_func, nn.Module):
             self._loss_func = loss_func
             self.loss_func_kwargs = None
         else:
             try:
-                if issubclass(loss_func, loss._Loss):
+                if issubclass(loss_func, nn.Module):
                     self._loss_func = loss_func(**self.loss_func_kwargs) if self.loss_func_kwargs else loss_func()
             except:
-                raise TypeError("`loss_func` must be a torch.nn.loss._Loss class or instance, "
+                raise TypeError("`loss_func` must be a custom loss nn.Module, a torch.nn.loss._Loss class or instance, "
                                 "or a string which refers to one by name")
 
     def set_mode(self, training: bool):
@@ -236,7 +236,8 @@ class TorchModel:
         return output
 
     @training_mode(True)
-    def fit(self, X: Iterable[T1], y: Iterable[T2], X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
+    def fit(self, X: Iterable[T1], y: Iterable[T2],
+            X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
             batch_size: Opt[int]=None, shuffle: bool=False,
             max_epochs: int=1, min_epochs: int=1, criterion_window: int=5,
             max_training_time: Opt[float]=None,
@@ -259,7 +260,8 @@ class TorchModel:
                            batch_report_interval=batch_report_interval, epoch_report_interval=epoch_report_interval)
 
     @training_mode(True)
-    def update(self, X: Iterable[T1], y: Iterable[T2], X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
+    def update(self, X: Iterable[T1], y: Iterable[T2],
+               X_test: Opt[Iterable[T1]]=None, y_test: Opt[Iterable[T2]]=None,
                batch_size: Opt[int] = None, shuffle: bool=False,
                max_epochs: int = 1, min_epochs: int = 1, criterion_window: int = 5,
                max_training_time: Opt[float] = None,
@@ -432,7 +434,7 @@ class TorchModel:
 
             self.print()
             if epoch >= min_epochs and (self.stop_training(tail(epoch_losses), tail(test_losses)) or
-                                            (max_training_time is not None and training_time >= max_training_time)):
+                                        (max_training_time is not None and training_time >= max_training_time)):
                 break
 
 
